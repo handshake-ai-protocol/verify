@@ -2,48 +2,67 @@
 
 Verification phases (each phase fails fast with a specific error code):
 
-  1. ``manifest_loaded``         — ``manifest.json`` parses; manifest
-                                   version supported.
-  2. ``module_catalog_drift``    — verifier's embedded module catalog
-                                   reproduces the manifest's
-                                   ``module_catalog_hash_hex``. Refuses
-                                   any pack whose Registry-side catalog
-                                   has drifted from this verifier's
-                                   embedded mirror.
-  3. ``path_outside_pack``       — every manifest-controlled file path
-                                   (DID documents, receipts, proofs)
-                                   resolves *inside* the pack root.
-                                   Refuses path-traversal attempts
-                                   crafted into the manifest.
-  4. ``leaf_hash_matches``       — for every receipt, SHA-256 over the
-                                   on-disk JSON bytes equals the
-                                   manifest's ``leaf_hash_hex``.
-  5. ``receipt_signature``       — for every receipt, the producer
-                                   signature over the JCS-canonical
-                                   envelope (with ``signature`` blanked)
-                                   verifies under the producer DID's
-                                   verification key.
-  6. ``inclusion_proof``         — RFC 6962 audit-path recomputation
-                                   yields the same root_hash as the
-                                   tree-head's ``root_hash_hex``.
-  7. ``module_assertions``       — every receipt's ``action`` matches the
-                                   module's capability filter; no
-                                   forbidden capabilities present.
+  1. ``manifest_loaded``               — ``manifest.json`` parses;
+                                         ``manifest_version`` supported.
+  2. ``module_catalog_drift``          — verifier's embedded module
+                                         catalog reproduces the
+                                         manifest's
+                                         ``module_catalog_hash_hex``.
+  3. ``path_outside_pack``             — every manifest-controlled file
+                                         path resolves *inside* the pack
+                                         root.
+  4. ``registry_did_*``                — ``did/registry.json`` matches
+                                         ``manifest.registry_did`` and
+                                         exposes a usable Ed25519 key.
+  5. ``tree_head_signature_invalid``   — both ``tree_head_start`` and
+                                         ``tree_head_end`` carry an
+                                         RFC-8032 Ed25519 signature
+                                         from the Registry over the
+                                         exact bound payload defined by
+                                         ``tree_head_signed_message``.
+  6. ``leaf_hash_matches``             — for every receipt, SHA-256 over
+                                         the on-disk JSON bytes equals
+                                         the manifest's
+                                         ``leaf_hash_hex``.
+  7. ``receipt_signature``             — for every receipt, the producer
+                                         signature over the JCS-canonical
+                                         envelope (with ``signature``
+                                         blanked) verifies under the
+                                         producer DID's *issuance-time*
+                                         verification key — looked up
+                                         by ``(iss_did, iss_did_version)``
+                                         in the manifest's
+                                         ``did_documents`` index.
+  8. ``inclusion_proof``               — RFC 6962 audit-path
+                                         recomputation against
+                                         ``tree_head_end`` for every
+                                         receipt; also against
+                                         ``tree_head_start`` for the
+                                         start-anchor receipts in
+                                         ``proofs_start/``.
+  9. ``module_assertions``             — every receipt's ``action``
+                                         matches the module's capability
+                                         filter; no forbidden
+                                         capabilities present.
 
 The verifier deliberately runs every receipt before exiting, so the
 report lists ALL failures rather than the first one (better auditor UX).
 
-Why no Trillian tree-head signature check?
-------------------------------------------
-Earlier drafts embedded the latest Trillian-signed ``LogRootV1`` bytes
-plus the Registry's signature over them. That broke determinism: the
-same (module, range, tenant, receipt-set) input would produce different
-zips on different days because Trillian only signs the *latest* root
-and the latest root keeps moving. Tree-level non-repudiation across time
-is delivered by the public log-witness layer (Phase 8); the per-pack
-artifact only needs the receipts to chain to a *consistent* root, which
-the inclusion-proof cross-check guarantees. ADR-0013 has the full
-argument.
+Trust scope of the tree-head signatures
+---------------------------------------
+The Registry self-signs both tree-heads with its long-lived Ed25519 key
+(published as ``did/registry.json``). This proves THIS Registry, at the
+DID published in ``manifest.registry_did``, attested to the
+(tree_size, root_hash) pair while assembling the pack. The signatures
+are deterministic (RFC 8032) so the bytes are stable across rebuilds —
+preserving the "same input → byte-identical zip" contract.
+
+This is *Registry self-attestation*, NOT an independent witness over
+Trillian. The public log-witness layer in Phase 8 binds tree_head_end
+to externally-co-signed checkpoints; until then, the verifier prints a
+``[note]`` on PASS so an auditor cannot accidentally over-claim.
+ADR-0013 §"Tree-head pinning" and ADR-0014 §"Compliance filter
+contract" capture the trade-off.
 """
 
 from __future__ import annotations
@@ -62,7 +81,7 @@ from .merkle import recompute_root
 from .modules import get_module, module_catalog_hash_hex
 
 
-SUPPORTED_MANIFEST_VERSIONS = {"1"}
+SUPPORTED_MANIFEST_VERSIONS = {"2"}
 
 
 @dataclass
@@ -134,11 +153,6 @@ def verify_pack(pack_dir: str | Path) -> Report:
         return rep
 
     # ---- Module catalog drift check ------------------------------------------
-    # The Registry side embeds a SHA-256 over its JCS-canonical ModuleSpec.
-    # The verifier embeds an *independently vendored* mirror of the catalog.
-    # If they disagree, the assembler and the verifier are working from
-    # different rules: refuse the pack rather than silently apply a stale
-    # capability filter that might admit forbidden actions. See ADR-0014.
     expected_catalog_hash = str(manifest.get("module_catalog_hash_hex", ""))
     try:
         actual_catalog_hash = module_catalog_hash_hex(module_id)
@@ -164,22 +178,43 @@ def verify_pack(pack_dir: str | Path) -> Report:
         )
         return rep
 
-    # ---- Tree-head (deterministic, no Trillian signature) --------------------
-    head = manifest.get("tree_head_end") or {}
+    # ---- Tree-heads (start/end) ---------------------------------------------
+    head_start_raw = manifest.get("tree_head_start") or {}
+    head_end_raw = manifest.get("tree_head_end") or {}
     try:
-        tree_root = bytes.fromhex(str(head["root_hash_hex"]))
-        expected_tree_size = int(head["tree_size"])
+        start_root = bytes.fromhex(str(head_start_raw["root_hash_hex"]))
+        start_size = int(head_start_raw["tree_size"])
+        start_sig_b64 = str(head_start_raw["signature_b64u"])
+        start_signer = str(head_start_raw["signed_by_did"])
+        end_root = bytes.fromhex(str(head_end_raw["root_hash_hex"]))
+        end_size = int(head_end_raw["tree_size"])
+        end_sig_b64 = str(head_end_raw["signature_b64u"])
+        end_signer = str(head_end_raw["signed_by_did"])
     except (KeyError, ValueError) as exc:
-        rep.fail("tree_head_malformed", f"could not decode tree-head: {exc}")
+        rep.fail("tree_head_malformed", f"could not decode tree-heads: {exc}")
         return rep
-    if expected_tree_size <= 0 or len(tree_root) != 32:
+    if start_size <= 0 or end_size <= 0 or len(start_root) != 32 or len(end_root) != 32:
         rep.fail(
             "tree_head_invalid",
-            f"tree_size={expected_tree_size} root_hash_len={len(tree_root)}",
+            f"start={start_size}/{len(start_root)} end={end_size}/{len(end_root)}",
+        )
+        return rep
+    if start_size > end_size:
+        rep.fail(
+            "tree_head_invalid",
+            f"start_size={start_size} > end_size={end_size}",
         )
         return rep
 
     registry_did = str(manifest.get("registry_did", ""))
+    if start_signer != registry_did or end_signer != registry_did:
+        rep.fail(
+            "tree_head_signer_mismatch",
+            f"start signed_by_did={start_signer!r} or end signed_by_did="
+            f"{end_signer!r} differs from manifest.registry_did={registry_did!r}",
+        )
+
+    # Resolve the Registry's signing key.
     registry_doc_path = _safe_join(root, "did/registry.json", rep)
     if registry_doc_path is None or not registry_doc_path.is_file():
         rep.fail("registry_did_missing", "did/registry.json is absent from pack")
@@ -194,29 +229,76 @@ def verify_pack(pack_dir: str | Path) -> Report:
             "registry_did_mismatch",
             f"manifest registry_did={registry_did!r} != document id={registry_doc.get('id')!r}",
         )
+    registry_pubkey = _extract_ed25519_pubkey(registry_doc)
+    if registry_pubkey is None:
+        rep.fail(
+            "registry_pubkey_missing",
+            "did/registry.json has no Ed25519VerificationKey2020 we can parse",
+        )
+        return rep
 
-    # ---- Producer DID Documents → pubkeys ------------------------------------
-    did_pubkeys: dict[str, bytes | None] = {}
+    # Verify both tree-head signatures.
+    range_from = str(manifest.get("range_from", ""))
+    range_to = str(manifest.get("range_to", ""))
+    tenant_slug = str(manifest.get("tenant_slug", ""))
+    for position, head_size, head_root, sig_b64 in (
+        ("start", start_size, start_root, start_sig_b64),
+        ("end", end_size, end_root, end_sig_b64),
+    ):
+        msg = _tree_head_signed_message(
+            position=position,
+            tree_size=head_size,
+            root_hash_hex=head_root.hex(),
+            range_from=range_from,
+            range_to=range_to,
+            tenant_slug=tenant_slug,
+            module_id=module_id,
+            registry_did=registry_did,
+        )
+        try:
+            sig = _b64u_decode(sig_b64)
+        except (binascii.Error, ValueError) as exc:
+            rep.fail(
+                "tree_head_signature_b64",
+                f"{position}-head signature b64 invalid: {exc}",
+            )
+            continue
+        if len(sig) != 64 or not ed25519.verify(registry_pubkey, msg, sig):
+            rep.fail(
+                "tree_head_signature_invalid",
+                f"Registry Ed25519 signature on {position}-head did not verify",
+            )
+
+    # ---- Producer DID Documents → (did, version) → pubkey -------------------
+    did_pubkeys: dict[tuple[str, int], bytes | None] = {}
     for entry in manifest.get("did_documents", []):
         did = str(entry.get("did", ""))
         rel = str(entry.get("path", ""))
+        try:
+            version = int(entry.get("version", 0))
+        except (TypeError, ValueError):
+            rep.fail(
+                "producer_did_invalid",
+                f"non-integer version on did_documents entry for {did!r}",
+            )
+            continue
         doc_path = _safe_join(root, rel, rep)
         if doc_path is None:
-            did_pubkeys[did] = None
+            did_pubkeys[(did, version)] = None
             continue
         if not doc_path.is_file():
-            rep.fail("producer_did_missing", f"missing {rel}", receipt_id=None)
-            did_pubkeys[did] = None
+            rep.fail("producer_did_missing", f"missing {rel}")
+            did_pubkeys[(did, version)] = None
             continue
         try:
             doc = json.loads(doc_path.read_text("utf-8"))
         except json.JSONDecodeError as exc:
             rep.fail("producer_did_invalid", f"{rel}: {exc}")
-            did_pubkeys[did] = None
+            did_pubkeys[(did, version)] = None
             continue
         if doc.get("id") != did:
             rep.fail("producer_did_mismatch", f"{rel}: id != {did}")
-        did_pubkeys[did] = _extract_ed25519_pubkey(doc)
+        did_pubkeys[(did, version)] = _extract_ed25519_pubkey(doc)
 
     # ---- Per-receipt phases --------------------------------------------------
     spec = None
@@ -232,6 +314,15 @@ def verify_pack(pack_dir: str | Path) -> Report:
         rel = str(entry.get("path", ""))
         leaf_hash_hex = str(entry.get("leaf_hash_hex", ""))
         action = str(entry.get("action", ""))
+        try:
+            iss_did_version = int(entry.get("iss_did_version", 0))
+        except (TypeError, ValueError):
+            rep.fail(
+                "receipt_iss_did_version_invalid",
+                f"receipt {rid} has non-integer iss_did_version",
+                receipt_id=rid,
+            )
+            continue
 
         # Module filter: action MUST match the module's capability set.
         if spec is not None:
@@ -282,11 +373,11 @@ def verify_pack(pack_dir: str | Path) -> Report:
             continue
 
         iss_did = str(envelope.get("iss", entry.get("iss_did", "")))
-        producer_pubkey = did_pubkeys.get(iss_did)
+        producer_pubkey = did_pubkeys.get((iss_did, iss_did_version))
         if producer_pubkey is None:
             rep.fail(
                 "producer_pubkey_missing",
-                f"no public key resolved for iss DID {iss_did!r}",
+                f"no public key resolved for iss DID {iss_did!r} v{iss_did_version}",
                 receipt_id=rid,
             )
             continue
@@ -305,7 +396,7 @@ def verify_pack(pack_dir: str | Path) -> Report:
             )
             continue
 
-        # ---- Inclusion proof --------------------------------------------------
+        # ---- End-head inclusion proof ----------------------------------------
         proof_path = _safe_join(root, f"proofs/{rid}.json", rep, receipt_id=rid)
         if proof_path is None:
             continue
@@ -334,14 +425,10 @@ def verify_pack(pack_dir: str | Path) -> Report:
                 receipt_id=rid,
             )
             continue
-        if tree_size != expected_tree_size:
-            # Every receipt's inclusion proof must be rooted at the
-            # manifest's pinned tree-head size. A mismatch means the
-            # assembler shipped a pack whose proofs do not all chain to
-            # the same root — refuse rather than partially trust.
+        if tree_size != end_size:
             rep.fail(
                 "proof_tree_size_mismatch",
-                f"proof tree_size={tree_size} != manifest tree_head_end.tree_size={expected_tree_size}",
+                f"proof tree_size={tree_size} != manifest tree_head_end.tree_size={end_size}",
                 receipt_id=rid,
             )
             continue
@@ -356,15 +443,108 @@ def verify_pack(pack_dir: str | Path) -> Report:
         except ValueError as exc:
             rep.fail("inclusion_proof_invalid", str(exc), receipt_id=rid)
             continue
-        if recomputed != tree_root:
+        if recomputed != end_root:
             rep.fail(
                 "inclusion_proof_root_mismatch",
-                f"recomputed root {recomputed.hex()} != tree_head root {tree_root.hex()}",
+                f"recomputed end-root {recomputed.hex()} != tree_head_end "
+                f"root {end_root.hex()}",
                 receipt_id=rid,
             )
             continue
 
         rep.receipts_verified += 1
+
+    # ---- Start-head proofs --------------------------------------------------
+    # The manifest names the start-anchor receipts (those with
+    # tree_size_at_inclusion == start_size). For each, ``proofs_start/{rid}.json``
+    # carries an inclusion proof at start_size that MUST recompute to
+    # tree_head_start.root_hash_hex. We require at least one such
+    # receipt — refuse a manifest that claims the empty set.
+    #
+    # Crucially, each start-anchor proof is bound to the receipt entry it
+    # claims to anchor: rid MUST appear in manifest.receipts, and the
+    # proof's leaf_hash_hex MUST equal that receipt's leaf_hash_hex.
+    # Without this binding a tampered pack could anchor the start root
+    # using leaves entirely unrelated to the matched receipt-set
+    # (architect re-review CRITICAL #2 residual).
+    receipts_by_id: dict[str, dict[str, Any]] = {
+        str(e.get("receipt_id", "")): e for e in receipts
+    }
+    start_anchor_ids = list(manifest.get("start_anchor_receipt_ids", []) or [])
+    if not start_anchor_ids:
+        rep.fail(
+            "tree_head_start_unanchored",
+            "manifest declares no start_anchor_receipt_ids; cannot validate"
+            " tree_head_start without at least one inclusion proof at start_size",
+        )
+    for rid in start_anchor_ids:
+        rid = str(rid)
+        receipt_entry = receipts_by_id.get(rid)
+        if receipt_entry is None:
+            rep.fail(
+                "start_anchor_receipt_unknown",
+                f"start_anchor_receipt_ids[{rid!r}] does not appear in"
+                " manifest.receipts; cannot bind start-head proof to a"
+                " matched receipt",
+                receipt_id=rid,
+            )
+            continue
+        expected_leaf_hex = str(receipt_entry.get("leaf_hash_hex", ""))
+        sp_path = _safe_join(root, f"proofs_start/{rid}.json", rep, receipt_id=rid)
+        if sp_path is None:
+            continue
+        if not sp_path.is_file():
+            rep.fail(
+                "proof_start_missing",
+                f"proofs_start/{rid}.json absent",
+                receipt_id=rid,
+            )
+            continue
+        try:
+            sp = json.loads(sp_path.read_text("utf-8"))
+            sp_audit = [bytes.fromhex(h) for h in sp["audit_path_hex"]]
+            sp_leaf_index = int(sp["leaf_index"])
+            sp_tree_size = int(sp["tree_size"])
+            sp_leaf_hash_hex = str(sp["leaf_hash_hex"])
+            sp_leaf_hash = bytes.fromhex(sp_leaf_hash_hex)
+        except (json.JSONDecodeError, KeyError, ValueError) as exc:
+            rep.fail("proof_start_malformed", str(exc), receipt_id=rid)
+            continue
+        # Bind the start-head proof to the receipt entry: same leaf hash.
+        if sp_leaf_hash_hex != expected_leaf_hex:
+            rep.fail(
+                "start_anchor_leaf_mismatch",
+                f"proofs_start/{rid}.json leaf_hash {sp_leaf_hash_hex!r} != "
+                f"manifest receipt leaf_hash {expected_leaf_hex!r}",
+                receipt_id=rid,
+            )
+            continue
+        if sp_tree_size != start_size:
+            rep.fail(
+                "proof_start_tree_size_mismatch",
+                f"proofs_start/{rid}.json tree_size={sp_tree_size} != "
+                f"manifest tree_head_start.tree_size={start_size}",
+                receipt_id=rid,
+            )
+            continue
+        try:
+            sp_recomputed = recompute_root(
+                leaf_hash=sp_leaf_hash,
+                leaf_index=sp_leaf_index,
+                tree_size=sp_tree_size,
+                audit_path=sp_audit,
+            )
+        except ValueError as exc:
+            rep.fail("inclusion_proof_invalid", str(exc), receipt_id=rid)
+            continue
+        if sp_recomputed != start_root:
+            rep.fail(
+                "tree_head_start_root_mismatch",
+                f"start-head recomputed root {sp_recomputed.hex()} != "
+                f"tree_head_start root {start_root.hex()}",
+                receipt_id=rid,
+            )
+            continue
 
     return rep
 
@@ -372,6 +552,39 @@ def verify_pack(pack_dir: str | Path) -> Report:
 # ---------------------------------------------------------------------------
 # helpers
 # ---------------------------------------------------------------------------
+
+
+def _tree_head_signed_message(
+    *,
+    position: str,
+    tree_size: int,
+    root_hash_hex: str,
+    range_from: str,
+    range_to: str,
+    tenant_slug: str,
+    module_id: str,
+    registry_did: str,
+) -> bytes:
+    """Bound payload the Registry signs for one tree-head.
+
+    Mirrors :func:`handshake_registry.evidence.manifest.tree_head_signed_message`
+    byte-for-byte. Both sides MUST stay in lock-step; ADR-0013 §"Tree-head
+    pinning" documents the binding fields and rationale.
+    """
+    payload = {
+        "module_id": module_id,
+        "position": position,
+        "range_from": range_from,
+        "range_to": range_to,
+        "registry_did": registry_did,
+        "root_hash_hex": root_hash_hex,
+        "tenant_slug": tenant_slug,
+        "tree_size": tree_size,
+        "v": "handshake.tree_head/1",
+    }
+    return json.dumps(
+        payload, sort_keys=True, separators=(",", ":"), ensure_ascii=False
+    ).encode("utf-8")
 
 
 def _safe_join(
@@ -398,9 +611,6 @@ def _safe_join(
             receipt_id=receipt_id,
         )
         return None
-    # Reject absolute paths up-front; ``root / "/etc/passwd"`` would
-    # discard ``root`` entirely on POSIX. ``Path.is_absolute`` catches
-    # both POSIX absolute paths and Windows-drive paths defensively.
     if Path(rel).is_absolute():
         rep.fail(
             "path_outside_pack",
@@ -436,7 +646,6 @@ def _b58btc_decode(s: str) -> bytes:
         if c not in _B58_INDEX:
             raise ValueError(f"invalid base58 character: {c!r}")
         n = n * 58 + _B58_INDEX[c]
-    # Count leading "1"s as leading-zero bytes.
     pad = 0
     for c in s:
         if c == "1":
