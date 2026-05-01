@@ -36,9 +36,24 @@ class ModuleSpec:
     name: str
     capability_patterns: tuple[str, ...]
     forbidden_patterns: tuple[str, ...] = field(default=())
+    result_summary_markers: tuple[str, ...] = field(default=())
+    """Mirror of the Registry's ``ComplianceModule.result_summary_markers``.
+    A receipt in the pack is admissible if EITHER its ``action`` matches a
+    capability prefix OR its receipt body's ``result_summary`` carries a
+    truthy value at one of these keys. Markers participate in
+    :func:`module_catalog_hash_hex` so any drift between Registry and
+    verifier catalog raises ``module_catalog_drift``.
+    """
 
     def matches(self, action: str) -> bool:
         return any(action == p or action.startswith(p) for p in self.capability_patterns)
+
+    def matches_marker(self, result_summary: object) -> bool:
+        if not self.result_summary_markers:
+            return False
+        if not isinstance(result_summary, dict):
+            return False
+        return any(bool(result_summary.get(m)) for m in self.result_summary_markers)
 
     def is_forbidden(self, action: str) -> bool:
         if not self.forbidden_patterns:
@@ -66,16 +81,19 @@ MODULES: dict[str, ModuleSpec] = {
         id="hipaa",
         name="HIPAA Security Rule",
         capability_patterns=_PHI_PATTERNS + _OPERATOR_PATTERNS + _POLICY_PATTERNS,
+        result_summary_markers=("phi_accessed",),
     ),
     "pci_dss": ModuleSpec(
         id="pci_dss",
         name="PCI-DSS v4.0",
         capability_patterns=_CHD_PATTERNS + _OPERATOR_PATTERNS + _POLICY_PATTERNS,
+        result_summary_markers=("cardholder_accessed",),
     ),
     "glba": ModuleSpec(
         id="glba",
         name="GLBA Safeguards Rule",
         capability_patterns=_NPI_PATTERNS + _OPERATOR_PATTERNS + _POLICY_PATTERNS,
+        result_summary_markers=("npi_accessed",),
     ),
     "nist_ai_rmf": ModuleSpec(
         id="nist_ai_rmf",
@@ -129,6 +147,7 @@ def module_catalog_hash_hex(module_id: str) -> str:
         "name": spec.name,
         "capability_patterns": list(spec.capability_patterns),
         "forbidden_patterns": list(spec.forbidden_patterns),
+        "result_summary_markers": list(spec.result_summary_markers),
     }
     canonical = json.dumps(
         payload, sort_keys=True, ensure_ascii=False, separators=(",", ":")

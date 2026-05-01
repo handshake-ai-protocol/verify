@@ -324,20 +324,18 @@ def verify_pack(pack_dir: str | Path) -> Report:
             )
             continue
 
-        # Module filter: action MUST match the module's capability set.
-        if spec is not None:
-            if not spec.matches(action):
-                rep.fail(
-                    "action_outside_module",
-                    f"action {action!r} does not match module {module_id!r} capability filter",
-                    receipt_id=rid,
-                )
-            if spec.is_forbidden(action):
-                rep.fail(
-                    "action_forbidden",
-                    f"action {action!r} is on the module's forbidden list",
-                    receipt_id=rid,
-                )
+        # Module filter: a receipt is admissible if EITHER its action
+        # matches a capability prefix OR its body's ``result_summary``
+        # contains a truthy marker the module declares. The marker
+        # check is deferred until after the envelope is parsed (below)
+        # — but ``forbidden_patterns`` are still rejected up-front
+        # since they are a hard exclusion regardless of markers.
+        if spec is not None and spec.is_forbidden(action):
+            rep.fail(
+                "action_forbidden",
+                f"action {action!r} is on the module's forbidden list",
+                receipt_id=rid,
+            )
 
         receipt_path = _safe_join(root, rel, rep, receipt_id=rid)
         if receipt_path is None:
@@ -395,6 +393,22 @@ def verify_pack(pack_dir: str | Path) -> Report:
                 receipt_id=rid,
             )
             continue
+
+        # ── Module-admission check (deferred from up-front so the
+        # marker-based path can see ``result_summary`` from the
+        # signature-verified body). A receipt with an action outside
+        # the module's capability filter MUST also produce a truthy
+        # marker in result_summary the module declares; otherwise it
+        # is not admissible evidence.
+        if spec is not None and not spec.matches(action):
+            if not spec.matches_marker(body.get("result_summary")):
+                rep.fail(
+                    "action_outside_module",
+                    f"action {action!r} does not match module {module_id!r} "
+                    "capability filter and no result_summary marker is set",
+                    receipt_id=rid,
+                )
+                continue
 
         # ---- End-head inclusion proof ----------------------------------------
         proof_path = _safe_join(root, f"proofs/{rid}.json", rep, receipt_id=rid)
