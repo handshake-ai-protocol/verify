@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: MIT
 """Command-line entrypoint: ``python -m verifier <pack_dir>``.
 
 Exits 0 on success, 1 on any verification failure, 2 on usage errors.

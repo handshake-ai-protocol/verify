@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: MIT
 """RFC 6962 Merkle inclusion-proof verifier (stdlib-only).
 
 Trillian uses Certificate-Transparency-style domain separation:

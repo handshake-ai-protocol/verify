@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: MIT
 """Entrypoint: ``python -m verifier <pack_dir>``."""
 
 from __future__ import annotations

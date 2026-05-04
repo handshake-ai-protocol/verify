@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: MIT
 """Trillian SignedLogRoot parser — duplicates Registry's parse_log_root.
 
 Both layouts are supported (canonical Trillian + Handshake's Postgres

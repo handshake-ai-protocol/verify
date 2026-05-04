@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: MIT
 """Embedded compliance-module catalog.
 
 Mirrors the Registry's :mod:`handshake_registry.evidence.modules`. We

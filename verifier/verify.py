@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: MIT
 """Top-level verification orchestrator.
 
 Verification phases (each phase fails fast with a specific error code):

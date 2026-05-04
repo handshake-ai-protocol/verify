@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: MIT
 """Pure-Python Ed25519 verify (RFC 8032).
 
 Adapted from the public-domain reference implementation in RFC 8032

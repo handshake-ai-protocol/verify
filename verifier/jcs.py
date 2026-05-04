@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: MIT
 """RFC 8785 JCS (JSON Canonicalization Scheme) — stdlib-only.
 
 The Handshake receipt envelopes contain only the JSON subset emitted by
