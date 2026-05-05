@@ -1,6 +1,6 @@
 [project]
 name = "handshake-evidence-verifier"
-version = "0.2.4"
+version = "0.2.3"
 description = "Hermetic offline verifier for Handshake evidence packs."
 readme = "README.md"
 requires-python = ">=3.10"
