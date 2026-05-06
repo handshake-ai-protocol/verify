@@ -47,5 +47,5 @@ Documents. The verifier re-checks every layer:
 4. Every Trillian inclusion proof (RFC 6962 audit-path replay).
 5. Module-specific assertions (e.g. SOC 2 CC7.2 capability filter).
 
-See `docs/compliance/<module>.md` in the main repo for the per-module
-control matrix.
+See the security audit documentation included in your evidence pack for
+the per-module control matrix.
